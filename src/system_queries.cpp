@@ -15,6 +15,7 @@
 #include <stdplus/hash/tuple.hpp>
 
 #include <algorithm>
+#include <cstring>
 #include <format>
 #include <optional>
 #include <stdexcept>
@@ -365,7 +366,7 @@ bool deleteLinkLocalIPv4ViaNetlink(unsigned ifidx, const stdplus::SubnetAny& ip)
                 rtattr* rta = reinterpret_cast<rtattr*>(req.buf);
                 rta->rta_type = IFA_LOCAL;
                 rta->rta_len = RTA_LENGTH(sizeof(in_addr));
-                std::memcpy(RTA_DATA(rta), &addr, sizeof(in_addr));
+                memcpy(RTA_DATA(rta), &addr, sizeof(in_addr));
 
                 req.nlh.nlmsg_len += rta->rta_len;
 

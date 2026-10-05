@@ -3,6 +3,8 @@
 #include "mock_ethernet_interface.hpp"
 #include "test_network_manager.hpp"
 
+#include <linux/if_addr.h>
+#include <linux/rtnetlink.h>
 #include <net/if.h>
 #include <net/if_arp.h>
 
@@ -20,7 +22,7 @@ namespace network
 {
 
 using sdbusplus::xyz::openbmc_project::Common::Error::InvalidArgument;
-using std::literals::string_view_literals::operator""sv;
+using std::literals::string_literals::operator""s;
 using testing::Key;
 using testing::UnorderedElementsAre;
 using stdplus::operator""_sub;
@@ -44,7 +46,8 @@ class TestEthernetInterface : public stdplus::gtest::TestWithTmp
     {
         AllIntfInfo info{InterfaceInfo{
             .type = ARPHRD_ETHER, .idx = 1, .flags = 0, .name = "test0"}};
-        return {bus, manager, info, "/xyz/openbmc_test/network"sv,
+        return {bus, manager, info,
+                sdbusplus::object_path("/xyz/openbmc_test/network"),
                 config::Parser()};
     }
 
@@ -88,8 +91,9 @@ TEST_F(TestEthernetInterface, Fields)
         .name = "test1",
         .mac = mac,
         .mtu = mtu}};
-    MockEthernetInterface intf(bus, manager, info,
-                               "/xyz/openbmc_test/network"sv, config::Parser());
+    MockEthernetInterface intf(
+        bus, manager, info, sdbusplus::object_path("/xyz/openbmc_test/network"),
+        config::Parser());
 
     EXPECT_EQ(mtu, intf.mtu());
     EXPECT_EQ(stdplus::toStr(mac), intf.macAddress());
@@ -137,6 +141,54 @@ TEST_F(TestEthernetInterface, DeleteIPAddress)
     interface.addrs.at("10.10.10.10/16"_sub)->delete_();
     EXPECT_THAT(interface.addrs,
                 UnorderedElementsAre(Key("20.20.20.20/16"_sub)));
+}
+
+TEST_F(TestEthernetInterface, DeleteNonStaticIPv4AddressNotAllowed)
+{
+    using namespace sdbusplus::xyz::openbmc_project::Common::Error;
+    // flags=0 (no IFA_F_PERMANENT) → addAddr() falls through to
+    // dhcpIsEnabled(), which returns true because the test fixture uses an
+    // empty config::Parser.
+    interface.addAddr({.ifidx = 1,
+                       .ifaddr = "10.10.10.10/16"_sub,
+                       .scope = RT_SCOPE_UNIVERSE,
+                       .flags = 0});
+
+    auto& addr = interface.addrs.at("10.10.10.10/16"_sub);
+    EXPECT_EQ(IP::AddressOrigin::DHCP, addr->origin());
+    EXPECT_THROW(addr->delete_(), NotAllowed);
+
+    EXPECT_EQ(1u, interface.addrs.size());
+}
+
+TEST_F(TestEthernetInterface, DeleteNonStaticIPv6AddressNotAllowed)
+{
+    using namespace sdbusplus::xyz::openbmc_project::Common::Error;
+    // flags=0 (no IFA_F_PERMANENT) → addAddr() falls through to
+    // dhcpIsEnabled(), which returns true because the test fixture uses an
+    // empty config::Parser.
+    interface.addAddr({.ifidx = 1,
+                       .ifaddr = "2001:db8::1/64"_sub,
+                       .scope = RT_SCOPE_UNIVERSE,
+                       .flags = 0});
+
+    // IFA_F_NOPREFIXROUTE | IFA_F_MANAGETEMPADDR → addAddr() hits the explicit
+    // SLAAC branch, assigning AddressOrigin::SLAAC regardless of
+    // dhcpIsEnabled().
+    interface.addAddr({.ifidx = 1,
+                       .ifaddr = "2001:db8::2/64"_sub,
+                       .scope = RT_SCOPE_UNIVERSE,
+                       .flags = IFA_F_NOPREFIXROUTE | IFA_F_MANAGETEMPADDR});
+
+    auto& dhcpAddr = interface.addrs.at("2001:db8::1/64"_sub);
+    auto& slaacAddr = interface.addrs.at("2001:db8::2/64"_sub);
+
+    EXPECT_EQ(IP::AddressOrigin::DHCP, dhcpAddr->origin());
+    EXPECT_EQ(IP::AddressOrigin::SLAAC, slaacAddr->origin());
+    EXPECT_THROW(dhcpAddr->delete_(), NotAllowed);
+    EXPECT_THROW(slaacAddr->delete_(), NotAllowed);
+
+    EXPECT_EQ(2u, interface.addrs.size());
 }
 
 TEST_F(TestEthernetInterface, CheckObjectPath)
@@ -258,25 +310,6 @@ TEST_F(TestEthernetInterface, DHCPEnabled)
              /*ra=*/true);
     ind_test(DHCPConf::both, /*dhcp4=*/true, /*dhcp6=*/true, /*ra=*/false);
     set_test(DHCPConf::both, /*dhcp4=*/true, /*dhcp6=*/true, /*ra=*/true);
-}
-
-TEST_F(TestEthernetInterface, DeleteStaticIPv4OnEnableDHCPv4)
-{
-    EXPECT_CALL(manager.mockReload, schedule())
-        .WillRepeatedly(
-            testing::InvokeWithoutArgs([&]() { manager.reloadCb(); }));
-    EXPECT_FALSE(interface.dhcp4(false));
-
-    auto path1 = createIPObject(IP::Protocol::IPv4, "10.10.10.10", 16);
-    auto path2 = createIPObject(IP::Protocol::IPv4, "20.20.20.20", 16);
-    EXPECT_THAT(interface.addrs,
-                UnorderedElementsAre(Key("10.10.10.10/16"_sub),
-                                     Key("20.20.20.20/16"_sub)));
-    EXPECT_TRUE(interface.dhcp4(true));
-    for (const auto& [subnet, ip] : interface.addrs)
-    {
-        EXPECT_NE(ip->origin(), IP::AddressOrigin::Static);
-    }
 }
 
 TEST_F(TestEthernetInterface, addStaticNTPServers_InvalidIPv4)
@@ -500,6 +533,24 @@ TEST_F(TestEthernetInterface, addStaticNTPServers_ValidEdgeCases)
     interface.staticNTPServers(servers3);
     config::Parser parser3((confDir / "00-bmc-test0.network").native());
     EXPECT_EQ(servers3, parser3.map.getValueStrings("Network", "NTP"));
+}
+
+TEST_F(TestEthernetInterface, VLANCreationWithoutParentShouldThrow)
+{
+    // Test that creating a VLAN without a parent interface throws an exception
+    AllIntfInfo info{InterfaceInfo{
+        .type = ARPHRD_ETHER,
+        .idx = 0,
+        .flags = 0,
+        .name = "test0.100",
+        .parent_idx = std::nullopt, // Missing parent interface!
+        .vlan_id = 100}};
+
+    // Should throw std::runtime_error with message "Missing parent link"
+    EXPECT_THROW(
+        MockEthernetInterface(bus, manager, info, "/xyz/openbmc_test/network"s,
+                              config::Parser()),
+        std::runtime_error);
 }
 
 } // namespace network

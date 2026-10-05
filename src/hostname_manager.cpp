@@ -1,6 +1,7 @@
 #include "hostname_manager.hpp"
 
 #include "network_manager.hpp"
+#include "util.hpp"
 
 #include <phosphor-logging/lg2.hpp>
 #include <sdbusplus/bus.hpp>
@@ -242,40 +243,59 @@ void HostnameManager::setUniqueHostname()
 {
     std::string currentHostname = getCurrentHostname();
     std::string uniqueSuffix;
+    std::string uniqueHostname;
 
     // Try to get BMC serial number first
     std::string serialNumber = getBmcSerialNumber();
     if (!serialNumber.empty())
     {
         uniqueSuffix = serialNumber;
-        lg2::info("Using BMC Serial Number for unique hostname");
-    }
-    else
-    {
-        // Fallback to MAC address
-        lg2::warning(
-            "BMC Serial Number not available, falling back to MAC address");
-        std::string macAddress = getMacAddress();
-        if (!macAddress.empty())
+        std::string candidate = currentHostname + "-" + uniqueSuffix;
+        if (internal::isHostnameValid(candidate))
         {
-            uniqueSuffix = macAddress;
-            lg2::info("Using MAC Address for unique hostname");
+            uniqueHostname = candidate;
+            lg2::info("Using BMC Serial Number for unique hostname");
         }
         else
         {
-            lg2::error(
-                "Neither Serial Number nor MAC Address available, cannot set unique hostname");
-            return;
+            lg2::warning(
+                "BMC Serial Number produces invalid hostname, falling back to MAC address");
         }
     }
-
-    // Construct and set unique hostname
-    std::string newHostname = currentHostname + "-" + uniqueSuffix;
-
-    if (setHostname(newHostname))
+    else
+    {
+        lg2::warning(
+            "BMC Serial Number not available, falling back to MAC address");
+    }
+    if (uniqueHostname.empty())
+    {
+        std::string macAddress = getMacAddress();
+        if (!macAddress.empty())
+        {
+            std::erase(macAddress, ':');
+            uniqueSuffix = macAddress;
+            std::string candidate = currentHostname + "-" + uniqueSuffix;
+            if (internal::isHostnameValid(candidate))
+            {
+                uniqueHostname = candidate;
+                lg2::info("Using MAC Address for unique hostname");
+            }
+            else
+            {
+                lg2::warning("MAC Address produces invalid hostname");
+            }
+        }
+    }
+    if (uniqueHostname.empty())
+    {
+        lg2::error(
+            "Neither Serial Number nor MAC Address available, cannot set unique hostname");
+        return;
+    }
+    if (setHostname(uniqueHostname))
     {
         lg2::info("Unique hostname set successfully: {HOSTNAME}", "HOSTNAME",
-                  newHostname);
+                  uniqueHostname);
     }
     else
     {

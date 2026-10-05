@@ -6,6 +6,7 @@
 #include "types.hpp"
 
 #include <sys/wait.h>
+#include <unistd.h>
 
 #include <phosphor-logging/elog-errors.hpp>
 #include <phosphor-logging/lg2.hpp>
@@ -36,6 +37,11 @@ static constexpr std::string_view lldpdConfigFilePath = "/etc/lldpd.conf";
 namespace internal
 {
 
+static bool isSpace(char c) noexcept
+{
+    return std::isspace(static_cast<unsigned char>(c)) != 0;
+}
+
 bool isValidNtpServer(const std::string& server)
 {
     // Try IP validation (IPv4 or IPv6)
@@ -61,47 +67,85 @@ bool isValidNtpServer(const std::string& server)
     }
 }
 
+bool isHostnameValid(const std::string& hostname)
+{
+    try
+    {
+        stdplus::fromStr<stdplus::Hostname>(hostname);
+        return true;
+    }
+    catch (const std::invalid_argument&)
+    {
+        return false;
+    }
+}
+
 void executeCommandinChildProcess(stdplus::zstring_view path, char** args)
 {
-    using namespace std::string_literals;
+    auto logCmdFailure = [&](std::string_view statusMsg) {
+        stdplus::StrBuf buf;
+        stdplus::strAppend(buf, "`"sv, path, "`"sv);
+        for (size_t i = 0; args[i] != nullptr; ++i)
+        {
+            stdplus::strAppend(buf, " `"sv, args[i], "`"sv);
+        }
+        buf.push_back('\0');
+        lg2::error("Unable to execute command {CMD}: {STATUS}", "CMD",
+                   buf.data(), "STATUS", statusMsg);
+    };
+
     pid_t pid = fork();
 
     if (pid == 0)
     {
         execv(path.c_str(), args);
-        exit(255);
+        _exit(127);
     }
-    else if (pid < 0)
+
+    if (pid < 0)
     {
         auto error = errno;
         lg2::error("Error occurred during fork: {ERRNO}", "ERRNO", error);
         elog<InternalFailure>();
     }
-    else if (pid > 0)
-    {
-        int status;
-        while (waitpid(pid, &status, 0) == -1)
-        {
-            if (errno != EINTR)
-            {
-                status = -1;
-                break;
-            }
-        }
 
-        if (status < 0)
+    int status = 0;
+    while (waitpid(pid, &status, 0) == -1)
+    {
+        if (errno != EINTR)
         {
-            stdplus::StrBuf buf;
-            stdplus::strAppend(buf, "`"sv, path, "`"sv);
-            for (size_t i = 0; args[i] != nullptr; ++i)
-            {
-                stdplus::strAppend(buf, " `"sv, args[i], "`"sv);
-            }
-            buf.push_back('\0');
-            lg2::error("Unable to execute the command {CMD}: {STATUS}", "CMD",
-                       buf.data(), "STATUS", status);
+            auto error = errno;
+            lg2::error("Error occurred during waitpid: {ERRNO}", "ERRNO",
+                       error);
             elog<InternalFailure>();
         }
+    }
+
+    if (WIFSIGNALED(status))
+    {
+        logCmdFailure(stdplus::strCat("terminated by signal "sv,
+                                      std::to_string(WTERMSIG(status))));
+        elog<InternalFailure>();
+    }
+
+    if (!WIFEXITED(status))
+    {
+        logCmdFailure("child terminated abnormally");
+        elog<InternalFailure>();
+    }
+
+    int rc = WEXITSTATUS(status);
+    if (rc != 0)
+    {
+        if (rc == 127)
+        {
+            logCmdFailure("execv failed (exit 127)");
+        }
+        else
+        {
+            logCmdFailure(stdplus::strCat("exit code "sv, std::to_string(rc)));
+        }
+        elog<InternalFailure>();
     }
 }
 
@@ -117,25 +161,24 @@ std::string_view getIgnoredInterfacesEnv()
 }
 
 /** @brief Parse the comma separated interface names */
-std::unordered_set<std::string_view> parseInterfaces(
-    std::string_view interfaces)
+std::unordered_set<std::string> parseInterfaces(std::string_view interfaces)
 {
-    std::unordered_set<std::string_view> result;
+    std::unordered_set<std::string> result;
     while (true)
     {
         auto sep = interfaces.find(',');
         auto interface = interfaces.substr(0, sep);
-        while (!interface.empty() && std::isspace(interface.front()))
+        while (!interface.empty() && isSpace(interface.front()))
         {
             interface.remove_prefix(1);
         }
-        while (!interface.empty() && std::isspace(interface.back()))
+        while (!interface.empty() && isSpace(interface.back()))
         {
             interface.remove_suffix(1);
         }
         if (!interface.empty())
         {
-            result.insert(interface);
+            result.emplace(interface);
         }
         if (sep == interfaces.npos)
         {
@@ -147,7 +190,7 @@ std::unordered_set<std::string_view> parseInterfaces(
 }
 
 /** @brief Get the ignored interfaces */
-const std::unordered_set<std::string_view>& getIgnoredInterfaces()
+const std::unordered_set<std::string>& getIgnoredInterfaces()
 {
     static auto ignoredInterfaces = parseInterfaces(getIgnoredInterfacesEnv());
     return ignoredInterfaces;

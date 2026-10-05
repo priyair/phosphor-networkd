@@ -68,9 +68,10 @@ inline decltype(std::declval<Func>()()) ignoreError(
     return fallback;
 }
 
-static std::string makeObjPath(std::string_view root, std::string_view intf)
+static sdbusplus::object_path makeObjPath(const sdbusplus::object_path& root,
+                                          std::string_view intf)
 {
-    auto ret = stdplus::strCat(root, "/"sv, intf);
+    auto ret = stdplus::strCat(root.string(), "/"sv, intf);
     std::replace(ret.begin() + ret.size() - intf.size(), ret.end(), '.', '_');
     return ret;
 }
@@ -84,17 +85,19 @@ static bool validIntfIP(Addr a) noexcept
 EthernetInterface::EthernetInterface(
     stdplus::PinnedRef<sdbusplus::bus_t> bus,
     stdplus::PinnedRef<Manager> manager, const AllIntfInfo& info,
-    std::string_view objRoot, const config::Parser& config, bool enabled) :
+    const sdbusplus::object_path& objRoot, const config::Parser& config,
+    bool enabled) :
     EthernetInterface(bus, manager, info, makeObjPath(objRoot, *info.intf.name),
-                      config, enabled)
+                      config, enabled, std::monostate())
 {}
 
 EthernetInterface::EthernetInterface(
     stdplus::PinnedRef<sdbusplus::bus_t> bus,
     stdplus::PinnedRef<Manager> manager, const AllIntfInfo& info,
-    std::string&& objPath, const config::Parser& config, bool enabled) :
-    Ifaces(bus, objPath.c_str(), Ifaces::action::defer_emit), manager(manager),
-    bus(bus), objPath(std::move(objPath))
+    const sdbusplus::object_path& objPath, const config::Parser& config,
+    bool enabled, std::monostate /*unused*/) :
+    Ifaces(bus, objPath, Ifaces::action::defer_emit), manager(manager),
+    bus(bus), objPath(objPath)
 {
     interfaceName(*info.intf.name, true);
     auto dhcpVal = getDHCPValue(config);
@@ -126,12 +129,12 @@ EthernetInterface::EthernetInterface(
     {
         if (!info.intf.parent_idx)
         {
-            std::runtime_error("Missing parent link");
+            throw std::runtime_error("Missing parent link");
         }
-        vlan.emplace(bus, this->objPath.c_str(), info.intf, *this);
+        vlan.emplace(bus, this->objPath, info.intf, *this);
     }
-    dhcp4Conf.emplace(bus, this->objPath + "/dhcp4", *this, DHCPType::v4);
-    dhcp6Conf.emplace(bus, this->objPath + "/dhcp6", *this, DHCPType::v6);
+    dhcp4Conf.emplace(bus, this->objPath / "dhcp4", *this, DHCPType::v4);
+    dhcp6Conf.emplace(bus, this->objPath / "dhcp6", *this, DHCPType::v6);
     for (const auto& [_, addr] : info.addrs)
     {
         addAddr(addr);
@@ -151,6 +154,7 @@ EthernetInterface::EthernetInterface(
     if (!std::filesystem::exists(confPath))
     {
         writeConfigurationFile();
+        manager.get().reloadConfigs();
     }
 }
 
@@ -263,9 +267,9 @@ void EthernetInterface::addAddr(const AddressInfo& info)
     auto it = addrs.find(info.ifaddr);
     if (it == addrs.end())
     {
-        addrs.emplace(info.ifaddr, std::make_unique<IPAddress>(
-                                       bus, std::string_view(objPath), *this,
-                                       info.ifaddr, origin));
+        addrs.emplace(info.ifaddr,
+                      std::make_unique<IPAddress>(bus, objPath, *this,
+                                                  info.ifaddr, origin));
     }
     else
     {
@@ -289,9 +293,9 @@ void EthernetInterface::addStaticNeigh(const NeighborInfo& info)
     else
     {
         staticNeighbors.emplace(
-            *info.addr, std::make_unique<Neighbor>(
-                            bus, std::string_view(objPath), *this, *info.addr,
-                            *info.mac, Neighbor::State::Permanent));
+            *info.addr,
+            std::make_unique<Neighbor>(bus, objPath, *this, *info.addr,
+                                       *info.mac, Neighbor::State::Permanent));
     }
 }
 
@@ -334,10 +338,10 @@ void EthernetInterface::addStaticGateway(const StaticGatewayInfo& info)
     }
     else
     {
-        staticGateways.emplace(*info.gateway,
-                               std::make_unique<StaticGateway>(
-                                   bus, std::string_view(objPath), *this,
-                                   *info.gateway, protocolType));
+        staticGateways.emplace(
+            *info.gateway,
+            std::make_unique<StaticGateway>(bus, objPath, *this, *info.gateway,
+                                            protocolType));
     }
 }
 
@@ -388,18 +392,12 @@ ObjectPath EthernetInterface::ip(IP::Protocol protType, std::string ipaddress,
             Argument::ARGUMENT_VALUE(stdplus::toStr(prefixLength).c_str()));
     }
 
-    if (protType == IP::Protocol::IPv4 && dhcp4())
-    {
-        dhcp4(false);
-    }
-
     auto it = addrs.find(*ifaddr);
     if (it == addrs.end())
     {
         it = std::get<0>(addrs.emplace(
-            *ifaddr,
-            std::make_unique<IPAddress>(bus, std::string_view(objPath), *this,
-                                        *ifaddr, IP::AddressOrigin::Static)));
+            *ifaddr, std::make_unique<IPAddress>(bus, objPath, *this, *ifaddr,
+                                                 IP::AddressOrigin::Static)));
     }
     else
     {
@@ -449,9 +447,9 @@ ObjectPath EthernetInterface::neighbor(std::string ipAddress,
     if (it == staticNeighbors.end())
     {
         it = std::get<0>(staticNeighbors.emplace(
-            *addr, std::make_unique<Neighbor>(bus, std::string_view(objPath),
-                                              *this, *addr, *lladdr,
-                                              Neighbor::State::Permanent)));
+            *addr,
+            std::make_unique<Neighbor>(bus, objPath, *this, *addr, *lladdr,
+                                       Neighbor::State::Permanent)));
     }
     else
     {
@@ -514,9 +512,8 @@ ObjectPath EthernetInterface::staticGateway(std::string gateway,
     if (it == staticGateways.end())
     {
         it = std::get<0>(staticGateways.emplace(
-            route,
-            std::make_unique<StaticGateway>(bus, std::string_view(objPath),
-                                            *this, gateway, protocolType)));
+            route, std::make_unique<StaticGateway>(bus, objPath, *this, gateway,
+                                                   protocolType)));
     }
     else
     {
@@ -543,32 +540,6 @@ bool EthernetInterface::dhcp4(bool value)
 {
     if (dhcp4() != EthernetInterfaceIntf::dhcp4(value))
     {
-        if (value)
-        {
-            manager.get().addReloadPreHook([self = this]() {
-                self->deleteStaticIPs(IP::Protocol::IPv4);
-            });
-        }
-        else if (!value)
-        {
-            for (auto& [addr, ipObj] : addrs)
-            {
-                if (ipObj->origin() == IP::AddressOrigin::DHCP &&
-                    ipObj->type() == IP::Protocol::IPv4)
-                {
-                    try
-                    {
-                        ipObj->IPIfaces::origin(IP::AddressOrigin::Static);
-                    }
-                    catch (const std::exception& e)
-                    {
-                        lg2::error(
-                            "Failed persist DHCPv4 IP address on {NET_INTF}: {ERROR}",
-                            "NET_INTF", interfaceName(), "ERROR", e);
-                    }
-                }
-            }
-        }
         writeConfigurationFile();
         manager.get().reloadConfigs();
     }
@@ -601,32 +572,6 @@ EthernetInterface::DHCPConf EthernetInterface::dhcpEnabled(DHCPConf value)
 
     if (old4 != new4 || old6 != new6 || oldra != newra)
     {
-        if (new4 && !old4)
-        {
-            manager.get().addReloadPreHook([self = this]() {
-                self->deleteStaticIPs(IP::Protocol::IPv4);
-            });
-        }
-        else if (old4 && !new4)
-        {
-            for (auto& [addr, ipObj] : addrs)
-            {
-                if (ipObj->origin() == IP::AddressOrigin::DHCP &&
-                    ipObj->type() == IP::Protocol::IPv4)
-                {
-                    try
-                    {
-                        ipObj->IPIfaces::origin(IP::AddressOrigin::Static);
-                    }
-                    catch (const std::exception& e)
-                    {
-                        lg2::error(
-                            "Failed persist DHCPv4 IP address on {NET_INTF}: {ERROR}",
-                            "NET_INTF", interfaceName(), "ERROR", e);
-                    }
-                }
-            }
-        }
         writeConfigurationFile();
         manager.get().reloadConfigs();
     }
@@ -769,6 +714,13 @@ ServerList EthernetInterface::getNameServerFromResolvd() const
     ServerList servers;
     auto OBJ_PATH = std::format("{}{}", RESOLVED_SERVICE_PATH, ifIdx);
 
+    if (ifIdx == 0)
+    {
+        // Interface index is not yet available (ifIdx == 0).
+        // systemd-resolved has no corresponding object for link/0.
+        return servers;
+    }
+
     /*
       The DNS property under org.freedesktop.resolve1.Link interface contains
       an array containing all DNS servers currently used by resolved. It
@@ -802,8 +754,14 @@ ServerList EthernetInterface::getNameServerFromResolvd() const
         lg2::error(
             "Failed to get DNS information from systemd-resolved: {ERROR}",
             "ERROR", e);
+        return servers;
     }
     auto tupleVector = std::get_if<type>(&name);
+    if (tupleVector == nullptr)
+    {
+        lg2::error("Failed to parse DNS information from systemd-resolved");
+        return servers;
+    }
     for (auto i = tupleVector->begin(); i != tupleVector->end(); ++i)
     {
         int addressFamily = std::get<0>(*i);
@@ -826,7 +784,7 @@ ObjectPath EthernetInterface::createVLAN(uint16_t id)
                               Argument::ARGUMENT_VALUE(idStr.c_str()));
     }
 
-    auto objRoot = std::string_view(objPath).substr(0, objPath.rfind('/'));
+    auto objRoot = objPath.parent_path();
     auto macStr = MacAddressIntf::macAddress();
     std::optional<stdplus::EtherAddr> mac;
     if (!macStr.empty())
@@ -1220,9 +1178,9 @@ std::string EthernetInterface::defaultGateway6(std::string gateway)
 }
 
 EthernetInterface::VlanProperties::VlanProperties(
-    sdbusplus::bus_t& bus, stdplus::const_zstring objPath,
+    sdbusplus::bus_t& bus, const sdbusplus::object_path& objPath,
     const InterfaceInfo& info, stdplus::PinnedRef<EthernetInterface> eth) :
-    VlanIfaces(bus, objPath.c_str(), VlanIfaces::action::defer_emit),
+    VlanIfaces(bus, objPath, VlanIfaces::action::defer_emit),
     parentIdx(*info.parent_idx), eth(eth)
 {
     VlanIntf::id(*info.vlan_id, true);
@@ -1283,33 +1241,6 @@ bool EthernetInterface::emitLLDP(bool value)
 void EthernetInterface::reloadConfigs()
 {
     manager.get().reloadConfigs();
-}
-
-void EthernetInterface::deleteStaticIPs(std::optional<IP::Protocol> family)
-{
-    std::vector<stdplus::SubnetAny> toErase;
-    toErase.reserve(addrs.size());
-
-    for (const auto& [subnet, ip] : addrs)
-    {
-        if (ip->origin() == IP::AddressOrigin::Static &&
-            (!family.has_value() || ip->type() == *family))
-        {
-            toErase.emplace_back(subnet);
-        }
-    }
-
-    for (const auto& subnet : toErase)
-    {
-        auto it = addrs.find(subnet);
-        if (it == addrs.end())
-        {
-            continue;
-        }
-        std::unique_ptr<IPAddress> ptr = std::move(it->second);
-        addrs.erase(it);
-    }
-    writeConfigurationFile();
 }
 
 } // namespace network

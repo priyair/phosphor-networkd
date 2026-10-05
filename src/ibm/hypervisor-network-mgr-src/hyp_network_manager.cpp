@@ -201,7 +201,7 @@ void HypNetworkMgr::setBIOSTableAttrs()
             }
         }
     }
-    catch (const sdbusplus::exception::internal_exception& e)
+    catch (const sdbusplus::exception_t& e)
     {
         lg2::error("Error in making dbus call");
         throw std::runtime_error("DBus call failed");
@@ -223,14 +223,10 @@ void HypNetworkMgr::createIfObjects()
     // network configurations on the both.
     // create eth0 and eth1 objects
     lg2::info("Creating eth0 and eth1 objects");
-    interfaces.emplace(
-        "eth0", std::make_unique<HypEthInterface>(
-                    bus, sdbusplus::object_path(objectPath.str + "/eth0"),
-                    "eth0", *this));
-    interfaces.emplace(
-        "eth1", std::make_unique<HypEthInterface>(
-                    bus, sdbusplus::object_path(objectPath.str + "/eth1"),
-                    "eth1", *this));
+    interfaces.emplace("eth0", std::make_unique<HypEthInterface>(
+                                   bus, objectPath / "eth0", "eth0", *this));
+    interfaces.emplace("eth1", std::make_unique<HypEthInterface>(
+                                   bus, objectPath / "eth1", "eth1", *this));
 
     // Create ip address objects for each ethernet interface
     interfaces["eth0"]->createIPAddressObjects();
@@ -240,8 +236,8 @@ void HypNetworkMgr::createIfObjects()
 void HypNetworkMgr::createSysConfObj()
 {
     systemConf.reset(nullptr);
-    this->systemConf = std::make_unique<HypSysConfig>(
-        bus, sdbusplus::object_path(objectPath.str + "/config"), *this);
+    this->systemConf =
+        std::make_unique<HypSysConfig>(bus, objectPath / "config", *this);
 }
 
 } // namespace network
